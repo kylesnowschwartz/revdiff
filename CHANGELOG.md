@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.4.0 - 2026-05-21
+
+### New Features
+
+- add annotation exit code for automation #206 @umputun
+
+### Bug Fixes
+
+- fix Zellij popup size handling #204 @umputun
+- narrow revdiff review trigger #196 @umputun
+
 ## v1.3.0 - 2026-05-13
 
 ### New Features
