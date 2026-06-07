@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.6.0 - 2026-06-07
+
+### New Features
+
+- scroll the diff view with J/K hotkeys #224 @steve-mackinnon
+- add H/M/L screen-position motions to vim-motion preset #205 @andykog
+
+### Bug Fixes
+
+- drop redundant cmux close-surface to avoid killing the caller tab #225 @umputun
+
+### Improvements
+
+- don't fail the build when coverage submit fails bdfd5b8 @umputun
+
 ## v1.5.1 - 2026-06-06
 
 ### Bug Fixes
