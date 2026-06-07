@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.6.1 - 2026-06-07
+
+### Improvements
+
+- add shell completions for bash, zsh, and fish #226 @umputun
+
 ## v1.6.0 - 2026-06-07
 
 ### New Features
