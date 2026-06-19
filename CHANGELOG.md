@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.7.1 - 2026-06-19
+
+### Bug Fixes
+
+- open herd review tab in the agent's (caller's) workspace #232 @aldobrynin
+
 ## v1.7.0 - 2026-06-14
 
 ### New Features
