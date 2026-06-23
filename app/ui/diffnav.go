@@ -597,6 +597,11 @@ func (m *Model) scrollDiffViewportLine(delta int) {
 
 // handleDiffAction dispatches a resolved action when the diff pane is focused.
 func (m Model) handleDiffAction(action keymap.Action) (tea.Model, tea.Cmd) {
+	if m.handleDiffMovement(action) {
+		m.syncTOCActiveSection()
+		return m, nil
+	}
+
 	switch action {
 	case keymap.ActionFocusTree:
 		return m.handleSwitchToTree()
@@ -606,6 +611,35 @@ func (m Model) handleDiffAction(action keymap.Action) (tea.Model, tea.Cmd) {
 	case keymap.ActionScrollRight:
 		m.handleHorizontalScroll(1)
 		return m, nil
+	case keymap.ActionScrollCenter:
+		m.centerViewportOnCursor()
+		return m, nil
+	case keymap.ActionScrollTop:
+		m.topAlignViewportOnCursor()
+		return m, nil
+	case keymap.ActionScrollBottom:
+		m.bottomAlignViewportOnCursor()
+		return m, nil
+	case keymap.ActionDeleteAnnotation:
+		cmd := m.deleteAnnotation()
+		return m, cmd
+	case keymap.ActionToggleHunk:
+		m.toggleHunkExpansion()
+		return m, nil
+	case keymap.ActionSearch:
+		cmd := m.startSearch()
+		return m, cmd
+	case keymap.ActionOpenFileInEditor:
+		cmd := m.openSourceEditor()
+		return m, cmd
+	default: // actions handled by handleKey (quit, toggle_pane, filter, etc.) — not repeated here
+	}
+	m.syncTOCActiveSection()
+	return m, nil
+}
+
+func (m *Model) handleDiffMovement(action keymap.Action) bool {
+	switch action {
 	case keymap.ActionDown:
 		m.moveDiffCursorDown()
 		m.syncViewportToCursor()
@@ -628,28 +662,10 @@ func (m Model) handleDiffAction(action keymap.Action) (tea.Model, tea.Cmd) {
 		m.moveDiffCursorToStart()
 	case keymap.ActionEnd:
 		m.moveDiffCursorToEnd()
-	case keymap.ActionScrollCenter:
-		m.centerViewportOnCursor()
-		return m, nil
-	case keymap.ActionScrollTop:
-		m.topAlignViewportOnCursor()
-		return m, nil
-	case keymap.ActionScrollBottom:
-		m.bottomAlignViewportOnCursor()
-		return m, nil
-	case keymap.ActionDeleteAnnotation:
-		cmd := m.deleteAnnotation()
-		return m, cmd
-	case keymap.ActionToggleHunk:
-		m.toggleHunkExpansion()
-		return m, nil
-	case keymap.ActionSearch:
-		cmd := m.startSearch()
-		return m, cmd
-	default: // actions handled by handleKey (quit, toggle_pane, filter, etc.) — not repeated here
+	default:
+		return false
 	}
-	m.syncTOCActiveSection()
-	return m, nil
+	return true
 }
 
 // handleTreeAction dispatches a resolved action when the tree pane is focused.

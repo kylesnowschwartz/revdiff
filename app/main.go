@@ -220,6 +220,7 @@ func run(opts options) (int, error) {
 		TreeWidthRatio:   opts.TreeWidth,
 		Only:             opts.Only,
 		WorkDir:          workDir,
+		SourceEditor:     sourceEditorPolicy(opts, workDir),
 		ActiveThemeName:  themes.catalog.ActiveName(opts.Theme),
 		AnnotationMarker: opts.AnnotationMarker,
 		NewFileTree: func(entries []diff.FileEntry) ui.FileTreeComponent {
@@ -292,6 +293,32 @@ func annotationExitCode(enabled bool, output string) int {
 // been consumed and cannot be re-read. All other modes support reload.
 func reloadApplicable(opts options) bool {
 	return !opts.Stdin
+}
+
+func sourceEditorPolicy(opts options, workDir string) ui.SourceEditorPolicy {
+	switch {
+	case opts.Stdin:
+		return ui.SourceEditorPolicy{} // unsupported
+	case opts.compareAbsNew != "":
+		// Always prefer --compare-new in compare mode.
+		return ui.SourceEditorPolicy{
+			Available: true,
+			Root:      filepath.Dir(opts.compareAbsNew),
+			ExactPath: opts.compareAbsNew,
+		}
+	case workDir != "":
+		worktreeReview := !opts.Staged && opts.ref() == ""
+		return ui.SourceEditorPolicy{
+			Available: true,
+			Root:      workDir,
+			// When reviewing worktree changes, reload after edits and disallow
+			// editing annotated files because edits can orphan comments.
+			ReloadAfterCleanExit:         worktreeReview,
+			DisallowAnnotatedFileEditing: worktreeReview,
+		}
+	default:
+		return ui.SourceEditorPolicy{}
+	}
 }
 
 // resolveKeysPath returns the effective keybindings file path, falling back

@@ -26,6 +26,8 @@ import (
 type ExternalEditorMock struct {
 	// CommandFunc mocks the Command method.
 	CommandFunc func(content string) (*exec.Cmd, func(error) (string, error), error)
+	// SourceCommandFunc mocks the SourceCommand method.
+	SourceCommandFunc func(path string, line int) (*exec.Cmd, error)
 
 	// calls tracks calls to the methods.
 	calls struct {
@@ -34,8 +36,16 @@ type ExternalEditorMock struct {
 			// Content is the content argument value.
 			Content string
 		}
+		// SourceCommand holds details about calls to the SourceCommand method.
+		SourceCommand []struct {
+			// Path is the path argument value.
+			Path string
+			// Line is the line argument value.
+			Line int
+		}
 	}
-	lockCommand sync.RWMutex
+	lockCommand       sync.RWMutex
+	lockSourceCommand sync.RWMutex
 }
 
 // Command calls CommandFunc.
@@ -54,6 +64,24 @@ func (mock *ExternalEditorMock) Command(content string) (*exec.Cmd, func(error) 
 	return mock.CommandFunc(content)
 }
 
+// SourceCommand calls SourceCommandFunc.
+func (mock *ExternalEditorMock) SourceCommand(path string, line int) (*exec.Cmd, error) {
+	if mock.SourceCommandFunc == nil {
+		panic("ExternalEditorMock.SourceCommandFunc: method is nil but ExternalEditor.SourceCommand was just called")
+	}
+	callInfo := struct {
+		Path string
+		Line int
+	}{
+		Path: path,
+		Line: line,
+	}
+	mock.lockSourceCommand.Lock()
+	mock.calls.SourceCommand = append(mock.calls.SourceCommand, callInfo)
+	mock.lockSourceCommand.Unlock()
+	return mock.SourceCommandFunc(path, line)
+}
+
 // CommandCalls gets all the calls that were made to Command.
 // Check the length with:
 //
@@ -67,5 +95,23 @@ func (mock *ExternalEditorMock) CommandCalls() []struct {
 	mock.lockCommand.RLock()
 	calls = mock.calls.Command
 	mock.lockCommand.RUnlock()
+	return calls
+}
+
+// SourceCommandCalls gets all the calls that were made to SourceCommand.
+// Check the length with:
+//
+//	len(mockedExternalEditor.SourceCommandCalls())
+func (mock *ExternalEditorMock) SourceCommandCalls() []struct {
+	Path string
+	Line int
+} {
+	var calls []struct {
+		Path string
+		Line int
+	}
+	mock.lockSourceCommand.RLock()
+	calls = mock.calls.SourceCommand
+	mock.lockSourceCommand.RUnlock()
 	return calls
 }

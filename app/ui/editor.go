@@ -1,21 +1,34 @@
 package ui
 
 import (
+	"cmp"
+	"errors"
+	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/umputun/revdiff/app/diff"
+	"github.com/umputun/revdiff/app/editor"
 )
 
-// ExternalEditor abstracts launching the user's editor on seeded content and
-// reading the result back. The default wiring is app/editor.Editor; tests may
-// inject a stub. Defined on the consumer side per Go convention.
+// ExternalEditor abstracts editor processes used by the UI.
+// Annotation editing round-trips through a temp file,
+// while source-file opening launches an existing worktree file
+// without reading it back.
+// The default wiring is app/editor.Editor; tests may inject a stub.
+// Defined on the consumer side per Go convention.
 type ExternalEditor interface {
 	// Command prepares the editor invocation for content. Returns a *exec.Cmd
 	// ready to hand to tea.ExecProcess plus a complete function that the caller
 	// invokes from the completion callback to read the edited content back. The
 	// complete function also handles any temp-file cleanup.
 	Command(content string) (*exec.Cmd, func(error) (string, error), error)
+	// SourceCommand prepares the editor invocation for an existing source file.
+	SourceCommand(path string, line int) (*exec.Cmd, error)
 }
 
 // editorFinishedMsg is dispatched after the external editor spawned via Ctrl+E
@@ -94,6 +107,189 @@ func (m *Model) openEditor() tea.Cmd {
 	})
 }
 
+// sourceEditorFinishedMsg is dispatched after opening a worktree source file
+// in the external editor.
+type sourceEditorFinishedMsg struct {
+	err                  error
+	fileName             string
+	reloadAfterCleanExit bool
+}
+
+// sourceEditorTargetResult is the UI-side decision for one source-editor
+// request.
+type sourceEditorTargetResult struct {
+	// fileName is the displayed diff file captured when the editor launches.
+	fileName string
+
+	// sourcePath is the source file passed to ExternalEditor.
+	sourcePath string
+
+	// sourceLine is the optional one-based line passed to ExternalEditor.
+	sourceLine int
+
+	// reloadAfterCleanExit controls whether a clean editor exit reloads the
+	// displayed diff file.
+	reloadAfterCleanExit bool
+}
+
+func (m *Model) openSourceEditor() tea.Cmd {
+	result, err := m.sourceEditorTarget()
+	if err != nil {
+		m.editorState.hint = fmt.Sprintf("Editor unavailable: %v", err)
+		return nil
+	}
+	cmd, err := m.editor.SourceCommand(result.sourcePath, result.sourceLine)
+	if err != nil {
+		switch {
+		case errors.Is(err, editor.ErrSourceMissing):
+			m.editorState.hint = "Editor unavailable: file is missing"
+			return nil
+		case errors.Is(err, editor.ErrSourceNotRegular):
+			m.editorState.hint = "Editor unavailable: file is not regular"
+			return nil
+		}
+		return func() tea.Msg {
+			return sourceEditorFinishedMsg{err: err, fileName: result.fileName, reloadAfterCleanExit: result.reloadAfterCleanExit}
+		}
+	}
+	return tea.ExecProcess(cmd, func(runErr error) tea.Msg {
+		return sourceEditorFinishedMsg{err: runErr, fileName: result.fileName, reloadAfterCleanExit: result.reloadAfterCleanExit}
+	})
+}
+
+// sourceEditorTarget resolves the current UI selection to the worktree source
+// file that should be opened in the external editor.
+//
+// Selection errors describe states where launching the editor is not valid and
+// are suitable for display after the "Editor unavailable: " prefix. Filesystem
+// validation remains with ExternalEditor.SourceCommand so missing and
+// non-regular files keep the same command-boundary handling as other source
+// editor launches.
+func (m Model) sourceEditorTarget() (sourceEditorTargetResult, error) {
+	policy := m.cfg.sourceEditorPolicy
+	if !policy.Available {
+		return sourceEditorTargetResult{}, errors.New("source editor disabled")
+	}
+	if m.file.name == "" {
+		return sourceEditorTargetResult{}, errors.New("no file loaded")
+	}
+	if m.tree.FileStatus(m.file.name) == diff.FileDeleted {
+		return sourceEditorTargetResult{}, errors.New("file was deleted")
+	}
+	targetLine, ok, err := m.sourceEditorLine()
+	if err != nil {
+		return sourceEditorTargetResult{}, err
+	}
+	if !ok {
+		targetLine = 0
+	}
+	if policy.DisallowAnnotatedFileEditing && m.hasCurrentFileLineAnnotations() {
+		return sourceEditorTargetResult{}, errors.New("file has line annotations")
+	}
+	targetPath := cmp.Or(policy.ExactPath, m.file.name)
+	if !filepath.IsAbs(targetPath) {
+		// Relative displayed paths come from VCS diff data,
+		// so confine them to the source root.
+		// Absolute paths are explicit user input
+		// (e.g. --only=/path/to/file)
+		// and are therefore trusted for now.
+		if policy.Root == "" {
+			return sourceEditorTargetResult{}, errors.New("no source root")
+		}
+		if !filepath.IsLocal(targetPath) {
+			return sourceEditorTargetResult{}, errors.New("file path escapes worktree")
+		}
+		root, err := os.OpenRoot(policy.Root)
+		if err != nil {
+			return sourceEditorTargetResult{}, fmt.Errorf("open worktree root: %w", err)
+		}
+		defer root.Close()
+		if _, err := root.Stat(targetPath); err != nil && !os.IsNotExist(err) {
+			return sourceEditorTargetResult{}, errors.New("file path escapes worktree")
+		}
+		targetPath = filepath.Join(policy.Root, targetPath)
+	}
+	return sourceEditorTargetResult{
+		fileName:             m.file.name,
+		sourcePath:           targetPath,
+		sourceLine:           targetLine,
+		reloadAfterCleanExit: policy.ReloadAfterCleanExit,
+	}, nil
+}
+
+func (m Model) hasCurrentFileLineAnnotations() bool {
+	for _, a := range m.store.Get(m.file.name) {
+		if a.Line > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// sourceEditorLine maps the focused diff row to the current worktree line for
+// editor positioning.
+//
+// A false ok result means the file can still be opened without a line target,
+// either because no diff row is focused or because a removed row has no nearby
+// current-file anchor. An error means the focused row represents content that
+// cannot be opened as a source location, such as binary, placeholder,
+// collapsed context, collapsed-mode delete-only placeholders, or hidden
+// removed rows.
+func (m Model) sourceEditorLine() (line int, ok bool, err error) {
+	dl, ok := m.cursorDiffLine()
+	if !ok {
+		return 0, false, nil
+	}
+	if dl.IsBinary || dl.IsPlaceholder {
+		return 0, false, errors.New("no source line")
+	}
+	if dl.ChangeType == diff.ChangeRemove && m.modes.collapsed.enabled {
+		hunks := m.findHunks()
+		if m.isDeleteOnlyPlaceholder(m.nav.diffCursor, hunks) || m.isCollapsedHidden(m.nav.diffCursor, hunks) {
+			return 0, false, errors.New("no source line")
+		}
+	}
+	switch dl.ChangeType {
+	case diff.ChangeAdd, diff.ChangeContext:
+		if dl.NewNum > 0 {
+			return dl.NewNum, true, nil
+		}
+	case diff.ChangeRemove:
+		if line := m.nearestCurrentLine(); line > 0 {
+			return line, true, nil
+		}
+		return 0, false, nil
+	case diff.ChangeDivider:
+		return 0, false, errors.New("skipped context")
+	}
+	return 0, false, nil
+}
+
+// nearestCurrentLine finds the closest line that exists in the current file.
+// When previous and next rows are equally close, the previous row wins so a
+// deletion between two live lines lands where the removed content was anchored.
+func (m Model) nearestCurrentLine() int {
+	for distance := 1; m.nav.diffCursor-distance >= 0 || m.nav.diffCursor+distance < len(m.file.lines); distance++ {
+		if previous := m.nav.diffCursor - distance; previous >= 0 {
+			dl := m.file.lines[previous]
+			if !dl.IsBinary && !dl.IsPlaceholder && dl.ChangeType != diff.ChangeDivider && dl.ChangeType != diff.ChangeRemove {
+				if dl.NewNum > 0 {
+					return dl.NewNum
+				}
+			}
+		}
+		if next := m.nav.diffCursor + distance; next < len(m.file.lines) {
+			dl := m.file.lines[next]
+			if !dl.IsBinary && !dl.IsPlaceholder && dl.ChangeType != diff.ChangeDivider && dl.ChangeType != diff.ChangeRemove {
+				if dl.NewNum > 0 {
+					return dl.NewNum
+				}
+			}
+		}
+	}
+	return 0
+}
+
 // handleEditorFinished processes the result of an external editor session.
 // On success with non-empty content, the captured target fields drive
 // saveComment — this bypasses the single-line textinput so embedded newlines
@@ -134,5 +330,29 @@ func (m Model) handleEditorFinished(msg editorFinishedMsg) (tea.Model, tea.Cmd) 
 		return m, cmd
 	}
 	m.saveComment(msg.content, msg.fileName, msg.fileLevel, msg.line, msg.changeType)
+	return m, cmd
+}
+
+func (m Model) handleSourceEditorFinished(msg sourceEditorFinishedMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		log.Printf("[WARN] source editor session error: %v", msg.err)
+		m.editorState.hint = "Editor failed"
+		return m, nil
+	}
+	m.editorState.hint = "Returned from editor"
+	if !msg.reloadAfterCleanExit {
+		return m, nil
+	}
+	// Cross-file hunk navigation can advance the tree selection before the
+	// selected file load finishes. In that window, the editor returned for a
+	// stale displayed file, so leave the queued load in control.
+	if msg.fileName != m.tree.SelectedFile() {
+		m.nav.pendingHunkJump = nil
+		return m, nil
+	}
+	if msg.fileName != m.file.name {
+		return m, nil
+	}
+	cmd := m.reloadCurrentFile()
 	return m, cmd
 }

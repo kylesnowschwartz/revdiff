@@ -144,6 +144,36 @@ type ThemeSpec struct {
 	ChromaStyle string
 }
 
+// SourceEditorPolicy is the composition-root decision for opening source files
+// from the diff view.
+//
+// The UI consumes this policy instead of inferring source-editor support from
+// CLI-shaped fields such as ref, staged, or workDir.
+type SourceEditorPolicy struct {
+	// Available states whether source editing is supported in the current
+	// execution mode. It is false when the input has no stable source file
+	// target, such as --stdin.
+	Available bool
+
+	// Root resolves relative displayed paths before source-editor validation.
+	// Empty Root leaves relative paths unsupported even when source editing is
+	// otherwise available.
+	Root string
+
+	// ExactPath, when set, is the only source path opened for the current
+	// review. It bypasses displayed-path resolution while preserving line
+	// navigation from the focused diff row.
+	ExactPath string
+
+	// ReloadAfterCleanExit states whether a clean source-editor exit should
+	// reload the currently displayed diff file.
+	ReloadAfterCleanExit bool
+
+	// DisallowAnnotatedFileEditing rejects source-editor launches for files
+	// that already have line annotations.
+	DisallowAnnotatedFileEditing bool
+}
+
 // compile-time assertions — enforce that the concrete package types
 // satisfy the consumer-side interfaces.
 var (
@@ -257,20 +287,21 @@ type loadedFileState struct {
 // modelConfigState holds immutable or near-immutable session configuration.
 // these values are set once at startup and not changed during runtime.
 type modelConfigState struct {
-	ref              string   // git ref for diff
-	staged           bool     // show staged changes
-	only             []string // filter to show only matching files
-	workDir          string   // working directory for resolving absolute --only paths
-	noColors         bool     // keep monochrome output when previewing or applying themes
-	mouseTracking    bool     // true when the session enabled mouse tracking
-	noStatusBar      bool     // hide the status bar
-	noConfirmDiscard bool     // skip confirmation prompt on discard quit
-	crossFileHunks   bool     // allow [ and ] to jump across file boundaries
-	treeWidthRatio   int      // 1-10 units for file tree panel
-	tabSpaces        string   // spaces to replace tabs with
-	wrapIndent       int      // extra indent (in columns) for wrap continuation rows; 0 disables
-	annotPrefix      string   // cached: marker + " "
-	annotFilePrefix  string   // cached: marker + " file: "
+	ref                string             // git ref for diff
+	staged             bool               // show staged changes
+	only               []string           // filter to show only matching files
+	workDir            string             // working directory for resolving absolute --only paths
+	sourceEditorPolicy SourceEditorPolicy // source-file editor availability and target behavior
+	noColors           bool               // keep monochrome output when previewing or applying themes
+	mouseTracking      bool               // true when the session enabled mouse tracking
+	noStatusBar        bool               // hide the status bar
+	noConfirmDiscard   bool               // skip confirmation prompt on discard quit
+	crossFileHunks     bool               // allow [ and ] to jump across file boundaries
+	treeWidthRatio     int                // 1-10 units for file tree panel
+	tabSpaces          string             // spaces to replace tabs with
+	wrapIndent         int                // extra indent (in columns) for wrap continuation rows; 0 disables
+	annotPrefix        string             // cached: marker + " "
+	annotFilePrefix    string             // cached: marker + " file: "
 }
 
 // layoutState holds viewport and layout concerns that change on resize and pane toggles.
@@ -416,6 +447,12 @@ type compactState struct {
 	hint       string // transient status-bar message; cleared on next key press
 }
 
+// editorState holds transient feedback for opening worktree files in the
+// external editor. Annotation editor state stays on annotationState.
+type editorState struct {
+	hint string // transient status-bar message for source-editor launch outcomes
+}
+
 // keyState holds transient key-dispatch state for the leader-chord feature.
 // It lives separate from navigationState because chord state is a key-dispatch
 // concern, not a cursor/scroll concern — keeping the two split prevents
@@ -476,7 +513,7 @@ type Model struct {
 	diffRenderer Renderer
 	keymap       *keymap.Keymap
 	themes       ThemeCatalog   // theme catalog for discovery, resolve, and persistence
-	editor       ExternalEditor // launches $EDITOR for multi-line annotation editing
+	editor       ExternalEditor // launches $EDITOR for annotation editing and source-file opening
 
 	// grouped state
 	cfg    modelConfigState // immutable session config
@@ -492,6 +529,7 @@ type Model struct {
 	review      reviewInfoState   // invocation summary + whole-review aggregate stats for the review-info overlay
 	reload      reloadState       // pending-confirmation state and applicability for R reload
 	compact     compactState      // applicability + transient hint for compact diff mode
+	editorState editorState       // transient hint state for source-file editor launches
 	keys        keyState          // chord-pending state and transient hint for leader-chord keybindings
 	vim         vimState          // count accumulator, pending letter leader, and transient hint for vim-motion preset
 	wheel       wheelState        // diff-pane mouse wheel coalescing (debounced render via wheelDebounceMsg)
@@ -627,7 +665,8 @@ type ModelConfig struct {
 	WordDiff         bool     // enable intra-line word-diff highlighting
 	Only             []string // show only these files (match by exact path or path suffix)
 	WorkDir          string   // working directory for resolving absolute --only paths
-	ActiveThemeName  string   // name of theme currently applied (for theme selector cursor positioning)
+	SourceEditor     SourceEditorPolicy
+	ActiveThemeName  string // name of theme currently applied (for theme selector cursor positioning)
 	// CommitsApplicable is the composition-root verdict on whether the current
 	// invocation supports the info popup's commit-log section. Computed once in main.go from the
 	// full option set (stdin, staged, only, all-files, ref) and copied into Model
@@ -748,20 +787,21 @@ func NewModel(cfg ModelConfig) (Model, error) {
 		themes:       cfg.Themes,
 		editor:       ed,
 		cfg: modelConfigState{
-			ref:              cfg.Ref,
-			staged:           cfg.Staged,
-			only:             cfg.Only,
-			workDir:          cfg.WorkDir,
-			noColors:         cfg.NoColors,
-			mouseTracking:    cfg.MouseTracking,
-			noStatusBar:      cfg.NoStatusBar,
-			noConfirmDiscard: cfg.NoConfirmDiscard,
-			crossFileHunks:   cfg.CrossFileHunks,
-			treeWidthRatio:   cfg.TreeWidthRatio,
-			tabSpaces:        strings.Repeat(" ", cfg.TabWidth),
-			wrapIndent:       max(0, cfg.WrapIndent),
-			annotPrefix:      cfg.AnnotationMarker + " ",
-			annotFilePrefix:  cfg.AnnotationMarker + " file: ",
+			ref:                cfg.Ref,
+			staged:             cfg.Staged,
+			only:               cfg.Only,
+			workDir:            cfg.WorkDir,
+			sourceEditorPolicy: cfg.SourceEditor,
+			noColors:           cfg.NoColors,
+			mouseTracking:      cfg.MouseTracking,
+			noStatusBar:        cfg.NoStatusBar,
+			noConfirmDiscard:   cfg.NoConfirmDiscard,
+			crossFileHunks:     cfg.CrossFileHunks,
+			treeWidthRatio:     cfg.TreeWidthRatio,
+			tabSpaces:          strings.Repeat(" ", cfg.TabWidth),
+			wrapIndent:         max(0, cfg.WrapIndent),
+			annotPrefix:        cfg.AnnotationMarker + " ",
+			annotFilePrefix:    cfg.AnnotationMarker + " file: ",
 		},
 		layout: layoutState{
 			focus: paneTree,
@@ -835,6 +875,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleBlameLoaded(msg)
 	case editorFinishedMsg:
 		return m.handleEditorFinished(msg)
+	case sourceEditorFinishedMsg:
+		return m.handleSourceEditorFinished(msg)
 	case wheelDebounceMsg:
 		return m.handleWheelDebounce(msg)
 	}
@@ -862,6 +904,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// this point dismisses the last hint before the new action runs.
 	m.reload.hint = ""
 	m.compact.hint = ""
+	m.editorState.hint = ""
 	m.keys.hint = ""
 	m.vim.hint = ""
 
