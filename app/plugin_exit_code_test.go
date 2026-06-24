@@ -198,7 +198,7 @@ func TestPiCallerPreservesAnnotationExitCode(t *testing.T) {
 	assert.Contains(t, src, "if (result.signal)")
 	assert.Contains(t, src, "done(result.status ?? 1)")
 	assert.Contains(t, src, "revdiff terminated by signal")
-	assert.Contains(t, src, "return buildResult(launch, rawOutput);")
+	assert.Contains(t, src, "return buildResult(launch, rawOutput, cwd);")
 }
 
 func TestPiExecutableRegressionHasCIBunSetup(t *testing.T) {
@@ -240,7 +240,7 @@ func piTypeboxStub() string {
 
 func piExtensionHarness() string {
 	return `
-import { chmodSync as testChmodSync, mkdirSync as testMkdirSync, writeFileSync as testWriteFileSync } from "node:fs";
+import { chmodSync as testChmodSync, mkdirSync as testMkdirSync, realpathSync as testRealpathSync, writeFileSync as testWriteFileSync } from "node:fs";
 
 function testAssert(condition: unknown, message: string): asserts condition {
 	if (!condition) {
@@ -257,6 +257,7 @@ function assertArray(actual: string[], expected: string[], message: string): voi
 function fakeCtx(choice?: "uncommitted" | "branch") {
 	return {
 		hasUI: true,
+		cwd: process.cwd(),
 		isIdle: () => true,
 		ui: {
 			notifications: [] as string[],
@@ -319,6 +320,7 @@ function fakeRevdiffScript(): string {
 		"test -n \"$out\" || exit 22",
 		"printf '## src/app.go:12-14 (+)\\nfix it\\n' > \"$out\"",
 		"printf '%s\\n' \"$@\" > \"$FAKE_ARG_FILE\"",
+		"[ -z \"${FAKE_CWD_FILE:-}\" ] || pwd > \"$FAKE_CWD_FILE\"",
 		"exit 10",
 		"",
 	].join("\n");
@@ -374,6 +376,100 @@ async function testToolReturnsAnnotations(): Promise<void> {
 	}
 }
 
+function testReviewCwdResolution(): void {
+	const base = mkdtempSync(path.join(tmpdir(), "pi-revdiff-cwd-base-"));
+	const child = path.join(base, "child");
+	testMkdirSync(child, { recursive: true });
+	try {
+		const resolvedHome = resolveReviewCwd("~/", base);
+		testAssert(resolvedHome === homedir(), "~/ should expand to the home directory");
+		testAssert(resolveReviewCwd("child", base) === child, "relative cwd should resolve against ctx cwd");
+	} finally {
+		rmSync(base, { recursive: true, force: true });
+	}
+}
+
+async function testToolRejectsInvalidCwd(): Promise<void> {
+	const tempDir = mkdtempSync(path.join(tmpdir(), "pi-revdiff-invalid-cwd-"));
+	const file = path.join(tempDir, "not-a-dir.txt");
+	testWriteFileSync(file, "not a directory\n");
+	try {
+		const pi = fakePi();
+		revdiffExtension(pi);
+		const fileResult = await pi.tools.get("revdiff_review").execute("call-1", { cwd: file }, undefined, undefined, fakeCtx());
+		testAssert(fileResult.content[0].text === "Could not resolve revdiff working directory.", "file cwd should return a clear error");
+		const missingResult = await pi.tools
+			.get("revdiff_review")
+			.execute("call-2", { cwd: path.join(tempDir, "missing") }, undefined, undefined, fakeCtx());
+		testAssert(missingResult.content[0].text === "Could not resolve revdiff working directory.", "missing cwd should return a clear error");
+	} finally {
+		rmSync(tempDir, { recursive: true, force: true });
+	}
+}
+
+async function testToolCwdParameter(): Promise<void> {
+	const tempDir = mkdtempSync(path.join(tmpdir(), "pi-revdiff-cwd-"));
+	const fakeBin = path.join(tempDir, "revdiff");
+	const targetRepo = path.join(tempDir, "repo with spaces");
+	const argFile = path.join(tempDir, "args.txt");
+	const cwdFile = path.join(tempDir, "cwd.txt");
+	writeExecutable(fakeBin, fakeRevdiffScript());
+	testMkdirSync(targetRepo, { recursive: true });
+	testWriteFileSync(path.join(targetRepo, "README.md"), "hello\n");
+
+	const oldBin = process.env.REVDIFF_BIN;
+	const oldArgFile = process.env.FAKE_ARG_FILE;
+	const oldCwdFile = process.env.FAKE_CWD_FILE;
+	process.env.REVDIFF_BIN = fakeBin;
+	process.env.FAKE_ARG_FILE = argFile;
+	process.env.FAKE_CWD_FILE = cwdFile;
+	try {
+		const pi = fakePi();
+		revdiffExtension(pi);
+		const result = await pi.tools.get("revdiff_review").execute("call-1", { args: "README.md", cwd: targetRepo }, undefined, undefined, fakeCtx());
+		const text = result.content[0].text;
+		testAssert(text.includes("Captured 1 annotation for README.md."), "cwd parameter should still review target file");
+		testAssert(result.details.cwd === targetRepo, "tool details should preserve cwd for reruns");
+		testAssert(
+			testRealpathSync(readFileSync(cwdFile, "utf8").trim()) === testRealpathSync(targetRepo),
+			"revdiff should launch in requested directory",
+		);
+		let argText = readFileSync(argFile, "utf8");
+		testAssert(argText.includes("--only\nREADME.md\n"), "file target in requested directory should resolve to --only README.md");
+		testAssert(!argText.includes(targetRepo), "cwd parameter should not be passed as a revdiff argument");
+
+		rmSync(cwdFile, { force: true });
+		const rerun = await pi.tools
+			.get("revdiff_review")
+			.execute("call-2", { args: result.details.argsText, cwd: result.details.cwd }, undefined, undefined, fakeCtx());
+		testAssert(rerun.details.cwd === targetRepo, "rerun details should preserve cwd");
+		testAssert(
+			testRealpathSync(readFileSync(cwdFile, "utf8").trim()) === testRealpathSync(targetRepo),
+			"rerun should launch in requested directory",
+		);
+		argText = readFileSync(argFile, "utf8");
+		testAssert(argText.includes("--only\nREADME.md\n"), "rerun should use returned args with preserved cwd");
+		testAssert(!argText.includes(targetRepo), "rerun cwd should not be passed as a revdiff argument");
+	} finally {
+		if (oldBin === undefined) {
+			delete process.env.REVDIFF_BIN;
+		} else {
+			process.env.REVDIFF_BIN = oldBin;
+		}
+		if (oldArgFile === undefined) {
+			delete process.env.FAKE_ARG_FILE;
+		} else {
+			process.env.FAKE_ARG_FILE = oldArgFile;
+		}
+		if (oldCwdFile === undefined) {
+			delete process.env.FAKE_CWD_FILE;
+		} else {
+			process.env.FAKE_CWD_FILE = oldCwdFile;
+		}
+		rmSync(tempDir, { recursive: true, force: true });
+	}
+}
+
 async function testSignalTerminatedReviewFails(): Promise<void> {
 	const tempDir = mkdtempSync(path.join(tmpdir(), "pi-revdiff-signal-"));
 	const fakeBin = path.join(tempDir, "revdiff");
@@ -403,20 +499,21 @@ async function testSignalTerminatedReviewFails(): Promise<void> {
 }
 
 async function testArgumentResolution(): Promise<void> {
-	let launch = await resolveLaunchSpec("--output ignored --only 'docs/my plan.md'", fakeCtx());
+	const cwd = process.cwd();
+	let launch = await resolveLaunchSpec("--output ignored --only 'docs/my plan.md'", fakeCtx(), cwd);
 	testAssert(Boolean(launch), "expected launch after stripping --output");
 	assertArray(launch!.args, ["--only", "docs/my plan.md"], "--output stripping should preserve remaining args");
 	testAssert(launch!.label === "docs/my plan.md", "--only label should use target path");
 
-	launch = await resolveLaunchSpec("all-files exclude vendor and dist", fakeCtx());
+	launch = await resolveLaunchSpec("all-files exclude vendor and dist", fakeCtx(), cwd);
 	testAssert(Boolean(launch), "expected all-files shortcut launch");
 	assertArray(launch!.args, ["--all-files", "--exclude=vendor", "--exclude=dist"], "all-files shortcut should expand excludes");
 
-	launch = await resolveLaunchSpec("./docs/new-file.md", fakeCtx());
+	launch = await resolveLaunchSpec("./docs/new-file.md", fakeCtx(), cwd);
 	testAssert(Boolean(launch), "expected explicit path file launch");
 	assertArray(launch!.args, ["--only", "./docs/new-file.md"], "explicit path arg should map to --only");
 
-	launch = await resolveLaunchSpec("release/v1.2.3", fakeCtx());
+	launch = await resolveLaunchSpec("release/v1.2.3", fakeCtx(), cwd);
 	testAssert(Boolean(launch), "expected slash-dot token launch");
 	assertArray(launch!.args, ["release/v1.2.3"], "slash-dot token should stay a ref-like arg when path does not exist");
 
@@ -430,7 +527,7 @@ async function testRefLikePathArgKeepsRef(): Promise<void> {
 	try {
 		runGit(repo, ["checkout", "-b", "release/v1.2.3"]);
 		process.chdir(repo);
-		const launch = await resolveLaunchSpec("release/v1.2.3", fakeCtx());
+		const launch = await resolveLaunchSpec("release/v1.2.3", fakeCtx(), repo);
 		testAssert(Boolean(launch), "expected ref-like launch");
 		assertArray(launch!.args, ["release/v1.2.3"], "ref-like path arg should stay a ref when the git ref exists");
 		testAssert(launch!.label === "release/v1.2.3", "ref-like path label should stay the ref");
@@ -477,7 +574,7 @@ async function testNeedsAskWithoutMainStops(): Promise<void> {
 
 	try {
 		const ctx = fakeCtx();
-		const launch = await detectSmartLaunch(ctx);
+		const launch = await detectSmartLaunch(ctx, process.cwd());
 		testAssert(launch === undefined, "needsAsk without a main branch should not launch uncommitted review");
 		testAssert(
 			ctx.ui.notifications.some((message: string) => message.includes("Could not determine a revdiff target")),
@@ -495,8 +592,7 @@ async function testStagedSmartDetection(): Promise<void> {
 	try {
 		testWriteFileSync(path.join(mainRepo, "file.txt"), "main staged\n");
 		runGit(mainRepo, ["add", "file.txt"]);
-		process.chdir(mainRepo);
-		let launch = await detectSmartLaunch(fakeCtx());
+		let launch = await detectSmartLaunch(fakeCtx(), mainRepo);
 		testAssert(Boolean(launch), "expected staged launch on main");
 		assertArray(launch!.args, ["--staged"], "main staged-only should launch --staged");
 		testAssert(launch!.label === "staged changes", "main staged-only label should be staged changes");
@@ -504,12 +600,11 @@ async function testStagedSmartDetection(): Promise<void> {
 		runGit(featureRepo, ["checkout", "-b", "feature"]);
 		testWriteFileSync(path.join(featureRepo, "file.txt"), "feature staged\n");
 		runGit(featureRepo, ["add", "file.txt"]);
-		process.chdir(featureRepo);
-		launch = await detectSmartLaunch(fakeCtx("uncommitted"));
+		launch = await detectSmartLaunch(fakeCtx("uncommitted"), featureRepo);
 		testAssert(Boolean(launch), "expected dirty feature uncommitted launch");
 		assertArray(launch!.args, ["--staged"], "dirty feature uncommitted choice should launch --staged");
 
-		launch = await detectSmartLaunch(fakeCtx("branch"));
+		launch = await detectSmartLaunch(fakeCtx("branch"), featureRepo);
 		testAssert(Boolean(launch), "expected dirty feature branch launch");
 		assertArray(launch!.args, ["main"], "dirty feature branch choice should preserve branch diff");
 		testAssert(launch!.label === "feature vs main", "dirty feature branch label should identify main branch");
@@ -522,6 +617,9 @@ async function testStagedSmartDetection(): Promise<void> {
 
 await testCommandRoutesToSkill();
 await testToolReturnsAnnotations();
+testReviewCwdResolution();
+await testToolRejectsInvalidCwd();
+await testToolCwdParameter();
 await testSignalTerminatedReviewFails();
 await testArgumentResolution();
 await testRefLikePathArgKeepsRef();
