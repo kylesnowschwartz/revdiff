@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.8.0 - 2026-06-23
+
+### New Features
+
+- add agterm overlay backend #238 @umputun
+- open focused source in editor #233 @abhinav
+
+### Bug Fixes
+
+- restore mouse after editor return #235 @abhinav
+
 ## v1.7.1 - 2026-06-19
 
 ### Bug Fixes
