@@ -47,6 +47,7 @@ When the user asks to open an in-session review in revdiff (the conversation alr
 Some review targets are not the current repo state: a GitHub PR diff, a patch file on disk, or `git format-patch -1 --stdout` output. Pipe the unified diff into `revdiff --stdin` and the input is parsed as a real multi-file diff (one tree entry per file, hunk navigation, per-file annotations) instead of a context-only buffer. revdiff auto-detects the unified-diff signature; on a malformed patch the input falls back silently to raw-text mode.
 
 Use this instead of the normal launcher flow when:
+
 - the user asks to "review PR #N", "review this patch", "review `gh pr diff` output", or supplies a patch URL/path
 - the diff describes commits that are not checked out locally (e.g. someone else's branch on a remote-only PR)
 - the user pastes a unified diff and asks for a review of *that diff*, not the working tree
@@ -72,25 +73,17 @@ cat /tmp/feature.patch | "$("${CLAUDE_SKILL_DIR}/scripts/resolve-launcher.sh" la
 
 ## Workflow
 
-### Step 0: Verify Installation
-
-```bash
-which revdiff
-```
-
-If not found, guide installation:
-- `brew install umputun/apps/revdiff`
-- Binary releases: https://github.com/umputun/revdiff/releases
-
 ### Step 1: Determine Review Mode
 
 **All-files mode**: If `$ARGUMENTS` matches "all files", "all-files", or "browse all files" (with optional "exclude <prefix>" parts), use **all-files mode**:
+
 - Pass `--all-files` to the launcher
 - If user mentions exclude patterns (e.g., "exclude vendor", "exclude vendor and mocks"), pass each as `--exclude=<prefix>`
 - Skip ref detection entirely, go directly to Step 2
 - Example: "all files exclude vendor" → `--all-files --exclude=vendor`
 
 **File review mode**: If `$ARGUMENTS` is a single token that points at a file on disk (e.g., `docs/plans/feature.md`, `/tmp/notes.txt`, `README.md`, `main.go`, `file.blah`), treat it as file review:
+
 - Decide with `test -f "$ARGUMENTS"` — if the file exists, it's file review mode
 - Also treat as file review if the token starts with `/` or `./`, or contains `/` and has a file extension (e.g., `src/app.go`), even when the file is not yet reachable from the current directory
 - Skip ref detection entirely
@@ -107,6 +100,7 @@ ${CLAUDE_SKILL_DIR}/scripts/detect-ref.sh
 ```
 
 The script outputs structured fields:
+
 - `branch`, `main_branch`, `is_main`, `has_uncommitted`, `has_staged_only`
 - `suggested_ref` — the ref to pass to revdiff (empty = uncommitted changes)
 - `use_staged` — if `true`, pass `--staged` to the launcher (staged-only changes detected)
@@ -115,10 +109,12 @@ The script outputs structured fields:
 **When `use_staged: true`**, pass `--staged` to the launcher. This means all changes are in the index (staged) with nothing unstaged — without `--staged`, revdiff would show an empty diff.
 
 **When `needs_ask: true`** (on a feature branch with uncommitted changes), use AskUserQuestion:
+
 - **"Uncommitted only"** — pass no ref (review just working changes)
 - **"Branch vs {main_branch}"** — pass main_branch as ref (full branch diff including uncommitted)
 
 **When `needs_ask: false`**, use `suggested_ref` directly:
+
 - On main + uncommitted → no ref (uncommitted changes)
 - On main + staged only → no ref + `--staged` (staged changes)
 - On main + clean → `HEAD~1` (last commit)
@@ -143,6 +139,7 @@ The resolver and launcher MUST run in the same bash invocation — the resolver 
 **IMPORTANT — long-running command**: The launcher blocks until the user finishes reviewing in the TUI overlay, which can exceed the default bash tool timeout on many harnesses. Set the bash timeout parameter to the **maximum your harness allows** (e.g. 1800000 or higher on OpenCode). The resolver itself returns in milliseconds — the timeout cap applies to the launcher only. Do NOT use `run_in_background` for this — background-task handling is unreliable for interactive TUI launchers (processes may be killed unprompted, and polling loops can leave the session idle after the review finishes). If the review outlasts the timeout cap, the fallback in Step 3 handles it.
 
 The script:
+
 - Detects available terminal (tmux → Zellij → herdr → kitty → wezterm/Kaku → cmux → ghostty → iTerm2 → Emacs vterm)
 - Launches revdiff in an overlay
 - Captures annotation output to a temp file
@@ -157,12 +154,14 @@ The bundled launcher sets `REVDIFF_EXIT_CODE_ON_ANNOTATIONS`; exit `10` means an
 1. Tell the user: "The bash tool timed out, but revdiff may still be open. Let me know when you're done reviewing."
 2. Wait for the user to reply. They cannot respond while the overlay has focus, so their reply confirms revdiff has exited.
 3. Read the most recent output file (the launcher writes to `$TMPDIR` when set, falling back to `/tmp`):
+
    ```bash
    output_file="$(ls -t "${TMPDIR:-/tmp}"/revdiff-output-* 2>/dev/null | head -1)"
    if [ -n "$output_file" ] && [ -f "$output_file" ]; then
      cat "$output_file"
    fi
    ```
+
 4. If it has content, process as annotations below. If empty or no file, the user quit without annotating.
 
 This fallback is safe because revdiff writes the output file atomically on exit — there is never a partial read.
@@ -178,6 +177,7 @@ don't remove this validation
 ```
 
 Each annotation block has:
+
 - `## filename:line (type)` — which file and line, `(+)` = added, `(-)` = removed, `(file-level)` = file note
 - Comment text below — what the user wants changed
 
@@ -186,6 +186,7 @@ Each annotation block has:
 Split annotations into two categories:
 
 **Explanation requests** — annotation matches either rule (case-insensitive):
+
 - contains two or more consecutive question marks anywhere in the text (`??`, `???`, etc.) — a language-neutral shortcut for "please explain"
 - OR starts with one of: `explain`, `remind`, `describe`, `what is`, `what are`, `how does`, `how do`, `clarify`
 
@@ -213,6 +214,7 @@ The explanation loop continues until the user quits without annotating. This all
 ### Step 4: Plan Changes
 
 Enter plan mode (EnterPlanMode) to analyze code-change annotations:
+
 - List each annotation with file and line reference
 - Describe the planned change for each
 - Get user approval before modifying code
@@ -224,6 +226,7 @@ After plan approval, fix the actual source code. Each annotation is a directive.
 ### Step 6: Loop
 
 After fixing (or after "Continue review" from Step 3.5), run the launcher script again with the same ref. The user can:
+
 - Add more annotations → go back to Step 3
 - Quit without annotations → review complete (no output)
 
