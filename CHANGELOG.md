@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.9.0 - 2026-06-29
+
+### New Features
+
+- add automatic light/dark theme selection #237 @jrpat
+
+### Improvements
+
+- bump github.com/alecthomas/chroma/v2 from 2.26.1 to 2.27.0 #240 @dependabot
+- bump actions/checkout from 6 to 7 #239 @dependabot
+
+### Bug Fixes
+
+- use percentage pane size for zellij plan review #245 @max-two
+
 ## v1.8.1 - 2026-06-24
 
 ### Improvements
