@@ -547,6 +547,191 @@ func TestGit_ChangedFiles_NonRenameEmptyOldPath(t *testing.T) {
 	}
 }
 
+func TestGit_UntrackedRenames(t *testing.T) {
+	dir := setupTestRepo(t)
+	g := NewGit(dir)
+
+	writeFile(t, dir, "old.txt", "one\ntwo\nthree\nfour\nfive\n")
+	gitCmd(t, dir, "add", "old.txt")
+	gitCmd(t, dir, "commit", "-m", "initial")
+
+	// plain rename in the working tree: old.txt deleted (unstaged), new.txt untracked
+	err := os.Rename(filepath.Join(dir, "old.txt"), filepath.Join(dir, "new.txt"))
+	require.NoError(t, err)
+
+	indexBefore, err := os.ReadFile(filepath.Join(dir, ".git", "index")) //nolint:gosec // test-controlled path
+	require.NoError(t, err)
+
+	renames, err := g.UntrackedRenames([]string{"new.txt"})
+	require.NoError(t, err)
+	require.Len(t, renames, 1)
+	assert.Equal(t, FileRenamed, renames[0].Status)
+	assert.Equal(t, "new.txt", renames[0].Path)
+	assert.Equal(t, "old.txt", renames[0].OldPath)
+
+	// the real index must be byte-identical: detection runs off a throwaway copy
+	indexAfter, err := os.ReadFile(filepath.Join(dir, ".git", "index")) //nolint:gosec // test-controlled path
+	require.NoError(t, err)
+	assert.Equal(t, indexBefore, indexAfter, "real .git/index must be untouched")
+
+	// the working tree must be unchanged: old.txt still deleted, new.txt still untracked
+	status, err := exec.Command("git", "-C", dir, "status", "--porcelain").Output() //nolint:gosec // test-controlled args
+	require.NoError(t, err)
+	assert.Contains(t, string(status), " D old.txt")
+	assert.Contains(t, string(status), "?? new.txt")
+}
+
+func TestGit_UntrackedRenames_NotARename(t *testing.T) {
+	dir := setupTestRepo(t)
+	g := NewGit(dir)
+
+	writeFile(t, dir, "keep.txt", "stable\n")
+	gitCmd(t, dir, "add", "keep.txt")
+	gitCmd(t, dir, "commit", "-m", "initial")
+
+	// genuinely new untracked file, no deletion to pair with
+	writeFile(t, dir, "fresh.txt", "brand new\n")
+
+	renames, err := g.UntrackedRenames([]string{"fresh.txt"})
+	require.NoError(t, err)
+	assert.Empty(t, renames)
+}
+
+func TestGit_UntrackedRenames_Empty(t *testing.T) {
+	dir := setupTestRepo(t)
+	g := NewGit(dir)
+
+	renames, err := g.UntrackedRenames(nil)
+	require.NoError(t, err)
+	assert.Empty(t, renames)
+}
+
+func TestGit_FileDiff_UntrackedRename(t *testing.T) {
+	dir := setupTestRepo(t)
+	g := NewGit(dir)
+
+	writeFile(t, dir, "old.txt", "one\ntwo\nthree\nfour\nfive\n")
+	gitCmd(t, dir, "add", "old.txt")
+	gitCmd(t, dir, "commit", "-m", "initial")
+
+	// rename + edit: line two changed to TWO, new path untracked
+	err := os.Rename(filepath.Join(dir, "old.txt"), filepath.Join(dir, "new.txt"))
+	require.NoError(t, err)
+	writeFile(t, dir, "new.txt", "one\nTWO\nthree\nfour\nfive\n")
+
+	lines, err := g.FileDiff(FileDiffRequest{Path: "new.txt", OldPath: "old.txt"})
+	require.NoError(t, err)
+
+	added, removed := changeContents(lines)
+	assert.Equal(t, []string{"TWO"}, added, "only the edited line is added, not the whole file")
+	assert.Equal(t, []string{"two"}, removed)
+
+	// unchanged lines must render as context, proving this is a rename diff not an all-+ add
+	var ctx int
+	for _, l := range lines {
+		if l.ChangeType == ChangeContext {
+			ctx++
+		}
+	}
+	assert.Equal(t, 4, ctx, "rename diff keeps surrounding lines as context")
+}
+
+func TestGit_FileDiff_UntrackedRename_PureRename(t *testing.T) {
+	dir := setupTestRepo(t)
+	g := NewGit(dir)
+
+	writeFile(t, dir, "old.txt", "one\ntwo\nthree\n")
+	gitCmd(t, dir, "add", "old.txt")
+	gitCmd(t, dir, "commit", "-m", "initial")
+
+	// pure rename, no content change: diff should be empty (rename header only)
+	err := os.Rename(filepath.Join(dir, "old.txt"), filepath.Join(dir, "new.txt"))
+	require.NoError(t, err)
+
+	lines, err := g.FileDiff(FileDiffRequest{Path: "new.txt", OldPath: "old.txt"})
+	require.NoError(t, err)
+	added, removed := changeContents(lines)
+	assert.Empty(t, added, "pure rename has no added content")
+	assert.Empty(t, removed, "pure rename has no removed content")
+}
+
+func TestGit_UntrackedRenames_PathWithSpaces(t *testing.T) {
+	dir := setupTestRepo(t)
+	g := NewGit(dir)
+
+	writeFile(t, dir, "old name.txt", "one\ntwo\nthree\n")
+	gitCmd(t, dir, "add", "old name.txt")
+	gitCmd(t, dir, "commit", "-m", "initial")
+
+	err := os.Rename(filepath.Join(dir, "old name.txt"), filepath.Join(dir, "new name.txt"))
+	require.NoError(t, err)
+
+	renames, err := g.UntrackedRenames([]string{"new name.txt"})
+	require.NoError(t, err)
+	require.Len(t, renames, 1)
+	assert.Equal(t, "new name.txt", renames[0].Path)
+	assert.Equal(t, "old name.txt", renames[0].OldPath)
+}
+
+func TestGit_UntrackedRenames_PathspecMagicName(t *testing.T) {
+	dir := setupTestRepo(t)
+	g := NewGit(dir)
+
+	// filenames that look like git pathspec magic must be treated literally,
+	// not interpreted as :(top) etc. (regression guard for GIT_LITERAL_PATHSPECS)
+	oldName := ":(top)old.txt"
+	newName := ":(top)new.txt"
+	writeFile(t, dir, oldName, "one\ntwo\nthree\n")
+	gitCmd(t, dir, "add", "-A") // -A takes no pathspec, so the magic-looking name is staged safely
+	gitCmd(t, dir, "commit", "-m", "initial")
+
+	err := os.Rename(filepath.Join(dir, oldName), filepath.Join(dir, newName))
+	require.NoError(t, err)
+
+	renames, err := g.UntrackedRenames([]string{newName})
+	require.NoError(t, err)
+	require.Len(t, renames, 1)
+	assert.Equal(t, newName, renames[0].Path)
+	assert.Equal(t, oldName, renames[0].OldPath)
+
+	// the rename diff must also resolve instead of failing on pathspec magic
+	lines, err := g.FileDiff(FileDiffRequest{Path: newName, OldPath: oldName})
+	require.NoError(t, err)
+	added, removed := changeContents(lines)
+	assert.Empty(t, added)
+	assert.Empty(t, removed)
+}
+
+func TestGit_UntrackedRenames_NoCommits(t *testing.T) {
+	dir := setupTestRepo(t) // git init, no commits -> no .git/index yet
+	g := NewGit(dir)
+
+	writeFile(t, dir, "fresh.txt", "hello\n")
+
+	// must not error on the missing index; no commits means no rename is possible
+	renames, err := g.UntrackedRenames([]string{"fresh.txt"})
+	require.NoError(t, err)
+	assert.Empty(t, renames)
+}
+
+func TestGit_UntrackedRenames_RealErrorNotSwallowed(t *testing.T) {
+	dir := setupTestRepo(t)
+	g := NewGit(dir)
+
+	writeFile(t, dir, "old.txt", "one\ntwo\n")
+	gitCmd(t, dir, "add", "old.txt")
+	gitCmd(t, dir, "commit", "-m", "initial")
+	err := os.Rename(filepath.Join(dir, "old.txt"), filepath.Join(dir, "new.txt"))
+	require.NoError(t, err)
+
+	// force temp-index creation to fail with ENOENT (missing TMPDIR); the index
+	// itself exists, so this must propagate as a real error rather than be treated
+	// as the fresh-repo no-index case and silently disable detection.
+	t.Setenv("TMPDIR", filepath.Join(dir, "no-such-tmpdir"))
+	_, err = g.UntrackedRenames([]string{"new.txt"})
+	require.Error(t, err, "temp-index ENOENT must propagate, not be swallowed as no-index")
+}
+
 func TestGit_FileDiff(t *testing.T) {
 	dir := setupTestRepo(t)
 	g := NewGit(dir)
