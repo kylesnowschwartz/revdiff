@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.10.0 - 2026-07-03
+
+### New Features
+
+- flush annotations to output file without exiting (O key) #249 @umputun
+- add a Nix flake #247 @mvanhorn
+
 ## v1.9.1 - 2026-06-30
 
 ### Bug Fixes
