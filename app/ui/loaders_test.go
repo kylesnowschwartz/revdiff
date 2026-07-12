@@ -3,6 +3,7 @@ package ui
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1677,4 +1678,157 @@ func TestModel_ReloadCurrentFileNoOpWhenEmpty(t *testing.T) {
 	cmd := m.reloadCurrentFile()
 	assert.Nil(t, cmd, "reloadCurrentFile must be a no-op when no file is loaded")
 	assert.Equal(t, beforeSeq, m.file.loadSeq, "no load implies no seq bump")
+}
+
+func TestModel_LoadFilesReconcilesReviewedFingerprints(t *testing.T) {
+	entry := diff.FileEntry{Path: "a.go", Status: diff.FileModified}
+	original := []diff.DiffLine{
+		{OldNum: 1, NewNum: 1, Content: "context", ChangeType: diff.ChangeContext},
+		{OldNum: 2, Content: "old", ChangeType: diff.ChangeRemove},
+		{NewNum: 2, Content: "new", ChangeType: diff.ChangeAdd},
+	}
+
+	setup := func(t *testing.T, entries []diff.FileEntry, fileDiff func(diff.FileDiffRequest) ([]diff.DiffLine, error)) Model {
+		t.Helper()
+		renderer := &mocks.RendererMock{
+			ChangedFilesFunc: func(string, bool) ([]diff.FileEntry, error) { return entries, nil },
+			FileDiffFunc:     fileDiff,
+		}
+		m := testNewModel(t, renderer, annotation.NewStore(), noopHighlighter(), ModelConfig{})
+		m.tree.Rebuild([]diff.FileEntry{entry})
+		m.tree.SetReviewed(entry.Path, diff.FileFingerprint(entry, original))
+		return m
+	}
+
+	t.Run("unchanged semantic patch survives shifted lines and context", func(t *testing.T) {
+		shifted := []diff.DiffLine{
+			{ChangeType: diff.ChangeDivider, Content: "shifted"},
+			{OldNum: 100, NewNum: 100, Content: "new upstream context", ChangeType: diff.ChangeContext},
+			{OldNum: 101, Content: "old", ChangeType: diff.ChangeRemove},
+			{NewNum: 101, Content: "new", ChangeType: diff.ChangeAdd},
+		}
+		m := setup(t, []diff.FileEntry{entry}, func(diff.FileDiffRequest) ([]diff.DiffLine, error) { return shifted, nil })
+
+		result, _ := m.Update(m.loadFiles()())
+		model := result.(Model)
+
+		assert.True(t, model.tree.IsReviewed("a.go"))
+	})
+
+	t.Run("changed patch clears reviewed state", func(t *testing.T) {
+		changed := append([]diff.DiffLine(nil), original...)
+		changed[2].Content = "newer"
+		m := setup(t, []diff.FileEntry{entry}, func(diff.FileDiffRequest) ([]diff.DiffLine, error) { return changed, nil })
+
+		result, _ := m.Update(m.loadFiles()())
+		model := result.(Model)
+
+		assert.False(t, model.tree.IsReviewed("a.go"))
+	})
+
+	t.Run("missing file clears reviewed state", func(t *testing.T) {
+		m := setup(t, nil, func(diff.FileDiffRequest) ([]diff.DiffLine, error) {
+			t.Fatal("removed reviewed file must not fetch a diff")
+			return nil, nil
+		})
+
+		result, _ := m.Update(m.loadFiles()())
+		model := result.(Model)
+
+		assert.False(t, model.tree.IsReviewed("a.go"))
+	})
+
+	t.Run("fingerprint error fails closed", func(t *testing.T) {
+		m := setup(t, []diff.FileEntry{entry}, func(diff.FileDiffRequest) ([]diff.DiffLine, error) {
+			return nil, errors.New("diff unavailable")
+		})
+
+		msg := m.loadFiles()().(filesLoadedMsg)
+		require.Len(t, msg.warnings, 1)
+		result, _ := m.Update(msg)
+		model := result.(Model)
+
+		assert.False(t, model.tree.IsReviewed("a.go"))
+	})
+
+	t.Run("opaque binary diff clears reviewed state", func(t *testing.T) {
+		binary := []diff.DiffLine{{Content: diff.BinaryPlaceholder, IsBinary: true}}
+		m := setup(t, []diff.FileEntry{entry}, func(diff.FileDiffRequest) ([]diff.DiffLine, error) {
+			return binary, nil
+		})
+		m.tree.SetReviewed(entry.Path, diff.FileFingerprint(entry, binary))
+
+		result, _ := m.Update(m.loadFiles()())
+		model := result.(Model)
+
+		assert.False(t, model.tree.IsReviewed("a.go"))
+	})
+}
+
+func TestModel_LoadFilesFingerprintsOnlyReviewedPaths(t *testing.T) {
+	entries := []diff.FileEntry{
+		{Path: "a.go", Status: diff.FileModified},
+		{Path: "b.go", Status: diff.FileModified},
+		{Path: "c.go", Status: diff.FileModified},
+		{Path: "d.go", Status: diff.FileModified},
+		{Path: "e.go", Status: diff.FileModified},
+		{Path: "unreviewed.go", Status: diff.FileModified},
+	}
+	var mu sync.Mutex
+	var requested []string
+	renderer := &mocks.RendererMock{
+		ChangedFilesFunc: func(string, bool) ([]diff.FileEntry, error) { return entries, nil },
+		FileDiffFunc: func(req diff.FileDiffRequest) ([]diff.DiffLine, error) {
+			mu.Lock()
+			requested = append(requested, req.Path)
+			mu.Unlock()
+			return []diff.DiffLine{{Content: req.Path, ChangeType: diff.ChangeAdd}}, nil
+		},
+	}
+	m := testNewModel(t, renderer, annotation.NewStore(), noopHighlighter(), ModelConfig{})
+	m.tree.Rebuild(entries)
+	for _, path := range []string{"a.go", "b.go", "c.go", "d.go", "e.go"} {
+		m.tree.SetReviewed(path, "old-fingerprint")
+	}
+
+	_ = m.loadFiles()()
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.ElementsMatch(t, []string{"a.go", "b.go", "c.go", "d.go", "e.go"}, requested)
+}
+
+func TestModel_FetchEffectiveFileDiffStrictUntrackedError(t *testing.T) {
+	renderer := &mocks.RendererMock{
+		ChangedFilesFunc: func(string, bool) ([]diff.FileEntry, error) { return nil, nil },
+		FileDiffFunc:     func(diff.FileDiffRequest) ([]diff.DiffLine, error) { return nil, nil },
+	}
+	m := testNewModel(t, renderer, annotation.NewStore(), noopHighlighter(), ModelConfig{WorkDir: t.TempDir()})
+
+	_, err := m.fetchEffectiveFileDiff(diff.FileEntry{Path: "missing.bin", Status: diff.FileUntracked}, 0, true)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read untracked file missing.bin")
+}
+
+func TestModel_LoadFilesPreservesMarkAddedAfterReviewedSnapshot(t *testing.T) {
+	entry := diff.FileEntry{Path: "a.go", Status: diff.FileModified}
+	lines := []diff.DiffLine{{Content: "new", ChangeType: diff.ChangeAdd}}
+	renderer := &mocks.RendererMock{
+		ChangedFilesFunc: func(string, bool) ([]diff.FileEntry, error) { return []diff.FileEntry{entry}, nil },
+		FileDiffFunc:     func(diff.FileDiffRequest) ([]diff.DiffLine, error) { return lines, nil },
+	}
+	m := testNewModel(t, renderer, annotation.NewStore(), noopHighlighter(), ModelConfig{})
+	m.tree.Rebuild([]diff.FileEntry{entry})
+	m.file.name = entry.Path
+	m.file.lines = lines
+	loadCmd := m.loadFiles() // captures an empty reviewed snapshot
+
+	result, _ := m.handleMarkReviewed()
+	m = result.(Model)
+	require.True(t, m.tree.IsReviewed(entry.Path))
+	result, _ = m.Update(loadCmd())
+	m = result.(Model)
+
+	assert.True(t, m.tree.IsReviewed(entry.Path), "fresh mark must survive reconciliation of the older snapshot")
 }

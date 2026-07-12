@@ -200,6 +200,10 @@ type FileTreeComponent interface {
 	FilterActive() bool
 	// ReviewedCount returns the number of files marked as reviewed.
 	ReviewedCount() int
+	// ReviewedFingerprints returns a copy of reviewed paths and their semantic diff identities.
+	ReviewedFingerprints() map[string]string
+	// IsReviewed reports whether the given path is marked reviewed.
+	IsReviewed(path string) bool
 	// HasFile returns true if there is a file entry in the given direction.
 	HasFile(dir sidepane.Direction) bool
 	// Move navigates the cursor according to the given motion.
@@ -220,8 +224,14 @@ type FileTreeComponent interface {
 	ToggleFilter(annotated map[string]bool)
 	// RefreshFilter updates the filtered view with the current annotation state.
 	RefreshFilter(annotated map[string]bool)
-	// ToggleReviewed toggles the reviewed mark for the given file path.
-	ToggleReviewed(path string)
+	// SetReviewed marks a path reviewed at the supplied semantic diff identity.
+	SetReviewed(path, fingerprint string)
+	// Unreview removes the reviewed mark for a path.
+	Unreview(path string)
+	// ReconcileReviewed validates marks captured before a refreshed file-list load.
+	ReconcileReviewed(before, current map[string]string)
+	// ReconcileReviewedPath validates a reviewed mark when its refreshed diff is loaded.
+	ReconcileReviewedPath(path, currentFingerprint string)
 	// ScrollState reports the file tree's visible window after rendering.
 	ScrollState() sidepane.ScrollState
 	// Render renders the file tree into a string for display.
@@ -426,6 +436,16 @@ type reviewInfoState struct {
 	descriptionHighlighted string // result of precomputeDescriptionHighlight; computed once in NewModel because the description is static for the model's lifetime
 }
 
+// reviewedState coordinates semantic identities used by mark_reviewed. cache
+// contains identities from file loads in the current file-list generation.
+// pending tracks asynchronous identity loads started when a tree selection is
+// marked before its normal diff load has completed.
+type reviewedState struct {
+	cache   map[string]string
+	pending map[string]uint64
+	loadSeq uint64
+}
+
 // reloadState holds the pending-confirmation state for the R reload feature.
 // hint is a transient status-bar message cleared on the next key press.
 // applicable is false in stdin mode (stream consumed; reload impossible).
@@ -529,6 +549,7 @@ type Model struct {
 	annot       annotationState   // annotation input lifecycle state
 	commits     commitsState      // eagerly loaded commit log for the info popup
 	review      reviewInfoState   // invocation summary + whole-review aggregate stats for the review-info overlay
+	reviewed    reviewedState     // semantic fingerprints for mark_reviewed
 	reload      reloadState       // pending-confirmation state and applicability for R reload
 	compact     compactState      // applicability + transient hint for compact diff mode
 	editorState editorState       // transient hint state for source-file editor launches
@@ -564,6 +585,16 @@ type fileLoadedMsg struct {
 	err     error
 }
 
+// reviewFingerprintLoadedMsg is sent when mark_reviewed had to fetch a file's
+// effective diff because it was not already present in the current cache.
+type reviewFingerprintLoadedMsg struct {
+	path        string
+	seq         uint64
+	filesSeq    uint64 // file-list generation in which the mark request was started
+	fingerprint string
+	err         error
+}
+
 // blameLoadedMsg is sent when blame data for a file has been loaded.
 type blameLoadedMsg struct {
 	file string
@@ -574,10 +605,12 @@ type blameLoadedMsg struct {
 
 // filesLoadedMsg is sent when the changed file list is loaded.
 type filesLoadedMsg struct {
-	seq      uint64 // matches m.filesLoadSeq at the time the load was issued; mismatched messages are dropped
-	entries  []diff.FileEntry
-	err      error
-	warnings []string // non-fatal issues (staged/untracked fetch failures)
+	seq                  uint64 // matches m.filesLoadSeq at the time the load was issued; mismatched messages are dropped
+	entries              []diff.FileEntry
+	reviewedBefore       map[string]string // reviewed snapshot captured when this load began
+	reviewedFingerprints map[string]string // refreshed identities for paths reviewed before this load
+	err                  error
+	warnings             []string // non-fatal issues (staged/untracked/fingerprint failures)
 }
 
 // commitsLoadedMsg is sent when the commit log for the current ref range is loaded.
@@ -841,6 +874,7 @@ func NewModel(cfg ModelConfig) (Model, error) {
 			cfg:                    reviewCfg,
 			descriptionHighlighted: precomputeDescriptionHighlight(cfg.Highlighter, descriptionFromConfig(reviewCfg)),
 		},
+		reviewed:             reviewedState{cache: make(map[string]string), pending: make(map[string]uint64)},
 		reload:               reloadState{applicable: cfg.ReloadApplicable},
 		compact:              compactState{applicable: cfg.CompactApplicable},
 		annot:                annotationState{rowCache: make(map[annotCacheKey][]string)},
@@ -888,6 +922,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleReviewStatsLoaded(msg)
 	case fileLoadedMsg:
 		return m.handleFileLoaded(msg)
+	case reviewFingerprintLoadedMsg:
+		return m.handleReviewFingerprintLoaded(msg)
 	case blameLoadedMsg:
 		return m.handleBlameLoaded(msg)
 	case editorFinishedMsg:
