@@ -122,11 +122,19 @@ if [ -n "${AGTERM_SESSION_ID:-}" ] && command -v agtermctl >/dev/null 2>&1; then
     # shared target (+ socket) for every agtermctl call in this branch
     AGTERM_TARGET=(--target "$AGTERM_SESSION_ID")
     [ -n "${AGTERM_SOCKET:-}" ] && AGTERM_TARGET+=(--socket "$AGTERM_SOCKET")
+    # record which pane owns the block so agterm nav lands on the reviewing pane; agterm defaults to
+    # the left pane otherwise, which misroutes navigation from a split or scratch session. only a
+    # recognized value is passed, so anything else falls back to agterm's own default.
+    AGTERM_STATUS=(session status blocked --blink)
+    case "${AGTERM_PANE:-}" in
+        left|right|scratch) AGTERM_STATUS+=(--pane "$AGTERM_PANE") ;;
+    esac
     # claude code does not flag the session blocked while revdiff owns the overlay, so set it here
-    # (blocked + blink draws attention from other windows). the EXIT trap restores active on every
-    # exit path, and INT/TERM exit through it, so an interrupt never leaves the indicator stuck.
-    agtermctl session status blocked --blink "${AGTERM_TARGET[@]}" >/dev/null 2>&1 || true
-    trap 'agtermctl session status active "${AGTERM_TARGET[@]}" >/dev/null 2>&1 || true' EXIT
+    # (blocked + blink draws attention from other windows). the EXIT trap restores active AND removes
+    # the temp output file on every exit path, and INT/TERM exit through it, so an interrupt never
+    # leaves the indicator stuck or the file behind (this trap supersedes the earlier output-file one).
+    agtermctl "${AGTERM_STATUS[@]}" "${AGTERM_TARGET[@]}" >/dev/null 2>&1 || true
+    trap 'agtermctl session status active "${AGTERM_TARGET[@]}" >/dev/null 2>&1 || true; rm -f "$OUTPUT_FILE"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     rc=0

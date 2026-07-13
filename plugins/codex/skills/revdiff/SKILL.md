@@ -1,6 +1,6 @@
 ---
 name: revdiff
-description: Review diffs, files, and documents with inline annotations in a TUI overlay, or answer questions about revdiff usage, configuration, themes, and keybindings. Opens revdiff in tmux/zellij/herdr/kitty/wezterm/cmux/ghostty/iterm2/emacs-vterm, captures annotations, and addresses them. Works in git, hg, and jj repos (auto-detected). Activates on "revdiff", "review diff", "review changes", "annotate diff", "git review with revdiff", "hg review with revdiff", "review jj change", "interactive diff review", "revdiff all files", "review all files", "browse all files", "revdiff <file>", "revdiff README.md", "revdiff /tmp/notes.txt", "review this file", "annotate this file", "review file with revdiff", "open this review in revdiff", "show review in revdiff", "review in revdiff", "revdiff config", "revdiff themes", "revdiff keybindings", "how to configure revdiff", "what themes does revdiff have".
+description: Review diffs, files, and documents with inline annotations in a TUI overlay, or answer questions about revdiff usage, configuration, themes, and keybindings. Opens revdiff in agterm/tmux/zellij/herdr/kitty/wezterm/cmux/ghostty/iterm2/emacs-vterm, captures annotations, and addresses them. Works in git, hg, and jj repos (auto-detected). Activates on "revdiff", "review diff", "review changes", "annotate diff", "git review with revdiff", "hg review with revdiff", "review jj change", "interactive diff review", "revdiff all files", "review all files", "browse all files", "revdiff <file>", "revdiff README.md", "revdiff /tmp/notes.txt", "review this file", "annotate this file", "review file with revdiff", "open this review in revdiff", "show review in revdiff", "review in revdiff", "revdiff config", "revdiff themes", "revdiff keybindings", "how to configure revdiff", "what themes does revdiff have".
 argument-hint: 'optional: ref(s), "all files", or file path'
 allowed-tools: [Bash, Read, Edit, Write, Grep, Glob]
 ---
@@ -78,7 +78,7 @@ cat /tmp/feature.patch | $SCRIPT_DIR/launch-revdiff.sh --stdin
 
 ## How It Works
 
-1. Launch revdiff in a terminal overlay (tmux popup, Zellij floating pane, herdr tab, kitty overlay, wezterm/Kaku split-pane, cmux split, ghostty split+zoom, iTerm2 split pane, or Emacs vterm frame)
+1. Launch revdiff in a terminal overlay (agterm full-pane overlay, tmux popup, Zellij floating pane, herdr tab, kitty overlay, wezterm/Kaku split-pane, cmux split, ghostty split+zoom, iTerm2 split pane, or Emacs vterm frame)
 2. User navigates the diff, adds annotations on specific lines
 3. On quit, annotations are captured from stdout
 4. Codex reads annotations and addresses each one
@@ -155,12 +155,29 @@ $SCRIPT_DIR/launch-revdiff.sh [base] [against] [--staged] [--untracked] [--only=
 **IMPORTANT — long-running command**: The launcher blocks until the user finishes reviewing in the TUI overlay, which can exceed the default bash tool timeout. Set the bash timeout parameter to the **maximum your harness allows** (e.g. 1800000 or higher). Do NOT use `run_in_background` for this — background-task handling is unreliable for interactive TUI launchers. If the review outlasts the timeout cap, the fallback in Step 3 handles it.
 
 The script:
-- Detects available terminal (tmux → Zellij → herdr → kitty → wezterm/Kaku → cmux → ghostty → iTerm2 → Emacs vterm)
+- Detects available terminal (agterm → tmux → Zellij → herdr → kitty → wezterm/Kaku → cmux → ghostty → iTerm2 → Emacs vterm)
 - Launches revdiff in an overlay
 - Captures annotation output to a temp file
 - Prints captured annotations to stdout
 
 The bundled launcher sets `REVDIFF_EXIT_CODE_ON_ANNOTATIONS`; exit `10` means annotations were captured and is not a launcher failure. Treat other nonzero statuses as failures.
+
+#### Agterm sessions and approval escalation
+
+When Codex runs inside an agterm session, the launcher opens revdiff in agterm's native full-pane overlay — its first-choice backend, checked ahead of tmux. That branch needs `AGTERM_SESSION_ID` and `AGTERM_SOCKET` in the launcher's environment.
+
+Codex commands that require approval or escalation run in a fresh environment that **strips every `AGTERM_*` variable** (along with `TERM_PROGRAM` and `GHOSTTY_*`), keeping only `PATH`. Launched from there without those variables, the launcher skips the agterm branch and fails with `no overlay terminal available`.
+
+Before escalating, read the values in the normal (unescalated) environment and inline them as **literal** values in the approved command:
+
+```bash
+AGTERM_SESSION_ID='<captured-id>' \
+AGTERM_SOCKET='<captured-socket>' \
+$SCRIPT_DIR/launch-revdiff.sh --only=<file>
+```
+
+- Do NOT reference `$AGTERM_SESSION_ID` / `$AGTERM_SOCKET` inside the approved command — they are already unset there, so the expansion is empty. Read them first in the normal environment, then paste the literal strings.
+- Do NOT work around the missing session id by targeting the `active` session (agterm's default): that can open revdiff in an unrelated agterm window or session. The captured session id keeps the overlay on the reviewing session.
 
 ### Step 3: Process Annotations
 
