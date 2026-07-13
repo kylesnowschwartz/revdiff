@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.11.1 - 2026-07-13
+
+### Improvements
+
+- record agterm pane so blocked-status navigation returns to the reviewing pane
+- codex: document agterm backend and approval-escalation handling
+
+### Bug Fixes
+
+- restore output-file cleanup in the agterm overlay launcher
+
 ## v1.11.0 - 2026-07-12
 
 ### New Features
